@@ -1,0 +1,252 @@
+name: CI/CD Pipeline for Web Calculator
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: wkk08/web-calculator-ci-cd
+
+jobs:
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/unit/ -v --cov=app --cov-report=xml
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  functional-test:
+    name: Functional Tests
+    runs-on: ubuntu-latest
+    needs: unit-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run functional tests
+        run: |
+          python app.py &
+          APP_PID=$!
+          sleep 5
+          echo "测试健康检查..."
+          curl -f "http://localhost:5000/health" || (echo "健康检查失败"; exit 1)
+          echo "测试加法..."
+          curl -f "http://localhost:5000/add/2&3" || (echo "加法测试失败"; exit 1)
+          echo "测试乘法..."
+          curl -f "http://localhost:5000/multiply/4&5" || (echo "乘法测试失败"; exit 1)
+          echo "测试无效输入..."
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/add/abc&xyz")
+          if [ "$STATUS_CODE" -ne 400 ]; then
+            echo "无效输入测试失败，期望400，得到$STATUS_CODE"
+            exit 1
+          fi
+          echo "所有功能测试通过！"
+          kill $APP_PID 2>/dev/null || true
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [unit-test, functional-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Build Docker image locally
+        run: |
+          docker build -t web-calculator:${{ github.sha }} -t web-calculator:latest .
+          echo "✅ 本地镜像构建成功"
+      - name: Log in to GHCR with PAT
+        run: |
+          echo "${{ secrets.GHCR_PAT }}" | docker login ${{ env.REGISTRY }} -u wkk08 --password-stdin
+      - name: Tag and Push to GHCR
+        run: |
+          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          echo "开始推送镜像到 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} ..."
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          echo "✅ 镜像推送成功！"
+          echo "DEPLOY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
+
+  deploy:
+    name: Blue-Green Deployment
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Environment
+        run: |
+          echo "=== 设置 SSH 环境 ==="
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # 写入私钥，注意保留原始格式
+          echo "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # 添加主机到已知列表
+          ssh-keyscan -H ${{ secrets.DEPLOY_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          
+          echo "私钥文件预览 (前2行):"
+          head -2 ~/.ssh/deploy_key
+          echo "私钥文件权限:"
+          ls -la ~/.ssh/deploy_key
+          echo "=== SSH 环境设置完成 ==="
+
+      # >>> 核心：详细 SSH 连接调试步骤 <<<
+      - name: Debug SSH Connection (Verbose)
+        id: debug_ssh
+        run: |
+          echo "🧪 开始详细 SSH 连接调试（使用 -vvv 参数）..."
+          echo "命令：ssh -vvv -o BatchMode=yes -o ConnectTimeout=15 -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} \"echo 'SSH_TEST_OK'\""
+          echo "--------------------------------------------------"
+          
+          # 执行命令，捕获详细输出和退出码
+          ssh -vvv \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              -i ~/.ssh/deploy_key \
+              ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} \
+              "echo 'SSH_TEST_OK'" 2>&1 | tee /tmp/ssh_debug.log
+          
+          # 获取 ssh 命令的实际退出码
+          SSH_EXIT_CODE=${PIPESTATUS[0]}
+          echo "--------------------------------------------------"
+          echo "ssh 命令退出码 (exit code) = $SSH_EXIT_CODE"
+          
+          # 保存退出码供后续步骤判断
+          echo "SSH_EXIT_CODE=$SSH_EXIT_CODE" >> $GITHUB_ENV
+          
+          # 根据退出码给出初步诊断
+          if [ $SSH_EXIT_CODE -eq 0 ]; then
+            echo "✅ SSH 详细调试通过！连接成功。"
+          else
+            echo "❌ SSH 详细调试失败！退出码: $SSH_EXIT_CODE"
+            echo "请仔细查看上方 'ssh -vvv' 的完整输出，常见问题包括："
+            echo "1. 'Permission denied (publickey)' -> 私钥/公钥不匹配或服务器未授权"
+            echo "2. 'Connection timed out' -> 网络不通、防火墙、IP或端口错误"
+            echo "3. 'Could not resolve hostname' -> DEPLOY_SERVER_IP 配置错误"
+            echo "4. 'Load key ... invalid format' -> DEPLOY_SSH_PRIVATE_KEY 格式错误（检查换行）"
+            echo "5. 'Host key verification failed' -> 服务器密钥变更，需更新 known_hosts"
+            # 注意：此处不直接 exit 1，由下一步骤根据条件决定
+          fi
+
+      # 根据 SSH 调试结果决定是否继续部署
+      - name: Conditionally Execute Deployment
+        # 仅当 SSH 调试成功（退出码为0）时才运行此步骤
+        if: env.SSH_EXIT_CODE == 0
+        run: |
+          echo "🚀 SSH 连接已验证，开始执行部署流程..."
+          
+          # 1. 复制部署文件
+          echo "同步部署文件到服务器..."
+          scp -i ~/.ssh/deploy_key -o ConnectTimeout=10 -r deploy/* ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }}:${{ secrets.DEPLOY_DIR }}/
+          
+          # 2. 执行远程部署命令
+          echo "在远程服务器执行蓝绿部署..."
+          ssh -i ~/.ssh/deploy_key \
+              ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
+            cd ${{ secrets.DEPLOY_DIR }}
+            
+            # 设置环境变量（使用CI构建出的新镜像）
+            export IMAGE_TAG=\"${{ env.DEPLOY_IMAGE }}\"
+            
+            # 判断当前活跃颜色
+            if [ -f current_color ]; then
+              CURRENT_COLOR=\$(cat current_color)
+            else
+              CURRENT_COLOR=\"blue\"
+            fi
+            
+            # 确定新颜色
+            if [ \"\$CURRENT_COLOR\" = \"blue\" ]; then
+              NEW_COLOR=\"green\"
+            else
+              NEW_COLOR=\"blue\"
+            fi
+            
+            echo \"========================================\"
+            echo \"开始蓝绿部署\"
+            echo \"新镜像: \$IMAGE_TAG\"
+            echo \"新颜色: \$NEW_COLOR\"
+            echo \"========================================\"
+            
+            # 执行部署脚本
+            ./scripts/deploy \"\$IMAGE_TAG\" \"\$NEW_COLOR\"
+            
+            # 等待并健康检查
+            sleep 20
+            if ./scripts/health_check; then
+              ./scripts/switch_traffic \"\$NEW_COLOR\"
+              echo \"\$NEW_COLOR\" > current_color
+              echo \"✅ 部署成功！当前活跃颜色: \$NEW_COLOR\"
+            else
+              echo \"❌ 健康检查失败，执行回滚\"
+              ./scripts/rollback
+              exit 1
+            fi
+          "
+          
+          echo "✅ 远程部署命令执行完成。"
+          
+          # 3. 验证部署
+          echo "等待并验证服务..."
+          for i in {1..15}; do
+            if curl -f -s http://${{ secrets.DEPLOY_SERVER_IP }}/health > /dev/null; then
+              echo "✅ 最终验证成功！服务已健康运行。"
+              exit 0
+            fi
+            echo "尝试 $i/15: 服务尚未就绪，等待3秒..."
+            sleep 3
+          done
+          echo "❌ 最终验证失败：服务在超时后未响应。"
+          exit 1
+
+      # 如果 SSH 失败，明确提示并失败
+      - name: Fail if SSH Debug Failed
+        if: env.SSH_EXIT_CODE != 0
+        run: |
+          echo "❌❌❌ 由于 SSH 连接调试失败，部署流程已终止。❌❌❌"
+          echo "请完成以下检查："
+          echo "1. 查看上方 'Debug SSH Connection (Verbose)' 步骤的完整输出"
+          echo "2. 根据具体错误信息，核对 GitHub Secrets 中的以下配置："
+          echo "   - DEPLOY_SSH_PRIVATE_KEY (完整且格式正确的私钥)"
+          echo "   - DEPLOY_SERVER_IP (当前服务器IP: 请确认是 192.168.184.138)"
+          echo "   - DEPLOY_USER (登录用户名，如 root)"
+          echo "3. 在服务器上确认：公钥已添加到 ~/.ssh/authorized_keys，且文件权限为 600"
+          echo "4. 检查网络：从 GitHub IP 到您的服务器的 22 端口是否畅通"
+          exit 1
