@@ -2,23 +2,54 @@ name: CI/CD Pipeline for Web Calculator
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
 
 env:
-  # 关键修复 1: 明确指定组织下的完整镜像路径
+  # 固定镜像名称：使用您手动推送成功的路径
   REGISTRY: ghcr.io
-  # 使用 github.repository_owner 确保始终指向组织 wkk08
-  IMAGE_NAME: ${{ github.repository_owner }}/web-calculator-ci-cd
+  IMAGE_NAME: wkk08/web-calculator-ci-cd
 
 jobs:
-  # 1. 单元测试阶段
-  unit-tests:
+  # 第一阶段：单元测试
+  unit-test:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/unit/ -v --cov=app --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # 第二阶段：功能测试（使用您旧版本中直接、有效的方式）
+  functional-test:
+    name: Functional Tests
+    runs-on: ubuntu-latest
+    needs: unit-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -28,130 +59,100 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Run unit tests
-        run: |
-          if [ -d tests/unit ]; then
-            python -m pytest tests/unit/ -v --cov=app --cov-report=xml
-          else
-            echo "没有找到单元测试目录"
-          fi
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: unit-test-results
-          path: |
-            coverage.xml
-          retention-days: 7
-
-  # 2. 功能测试阶段
-  functional-tests:
-    runs-on: ubuntu-latest
-    needs: unit-tests
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Build test image
-        run: docker build -t web-calculator-test:${{ github.sha }} .
+          pip install -r requirements.txt
 
       - name: Run functional tests
         run: |
-          # 启动容器
-          docker run -d -p 5000:5000 --name web-calc-test web-calculator-test:${{ github.sha }}
+          # 启动Flask应用
+          python app.py &
+          APP_PID=$!
           
-          # 等待服务启动
-          sleep 10
+          # 等待应用启动
+          sleep 5
           
-          # 运行功能测试（如果存在）
-          if [ -f tests/func/run_curl_tests.sh ]; then
-            chmod +x tests/func/run_curl_tests.sh
-            ./tests/func/run_curl_tests.sh || true
+          # 运行测试
+          echo "测试健康检查..."
+          curl -f "http://localhost:5000/health" || (echo "健康检查失败"; exit 1)
+          
+          echo "测试加法..."
+          curl -f "http://localhost:5000/add/2&3" || (echo "加法测试失败"; exit 1)
+          
+          echo "测试乘法..."
+          curl -f "http://localhost:5000/multiply/4&5" || (echo "乘法测试失败"; exit 1)
+          
+          echo "测试无效输入..."
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/add/abc&xyz")
+          if [ "$STATUS_CODE" -ne 400 ]; then
+            echo "无效输入测试失败，期望400，得到$STATUS_CODE"
+            exit 1
           fi
           
-          # 清理
-          docker stop web-calc-test || true
-          docker rm web-calc-test || true
+          echo "所有功能测试通过！"
+          
+          # 停止应用
+          kill $APP_PID 2>/dev/null || true
 
-  # 3. 构建和推送 Docker 镜像（已修复关键问题）
+  # 第三阶段：构建与推送（全新设计，分离步骤，使用安全PAT）
   build-and-push:
+    name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: [unit-tests, functional-tests]
+    needs: [unit-test, functional-test]
+    # 只在推送到主分支时运行
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
-    # 关键修复 2：授予 GITHUB_TOKEN 推送包的必要权限
+    # 为后续可能的 GITHUB_TOKEN 使用声明权限
     permissions:
       contents: read
       packages: write
-    
-    # 只在推送到 main/master 分支时运行
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      # 关键修复 3：清理可能干扰的旧登录信息，并使用正确的凭据登录
-      - name: Logout from GHCR to clear cache
-        run: docker logout ghcr.io || true
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
-        with:
-          registry: ${{ env.REGISTRY }}
-          # 关键修复 4：用户名使用仓库所有者 (wkk08)，而非触发者
-          username: ${{ github.repository_owner }}
-          # 关键修复 5：使用GITHUB_TOKEN，而非泄露的PAT
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # 关键修复 6：确保元数据 Action 生成的镜像名指向 wkk08 组织
-      - name: Extract metadata for tags
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Generate deployment info
+      - name: Build Docker image locally
+        id: build
         run: |
-          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
-          echo "IMAGE_FULL_NAME=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
+          # 构建镜像，使用两种标签
+          docker build -t web-calculator:${{ github.sha }} -t web-calculator:latest .
+          echo "✅ 本地镜像构建成功"
+          docker images | grep web-calculator
 
-      - name: Create deployment info file
+      # 核心修改：采用与您本地手动推送完全一致的登录和推送逻辑
+      - name: Log in to GHCR with PAT
         run: |
-          echo "Build completed at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > build-info.txt
-          echo "Commit SHA: ${{ github.sha }}" >> build-info.txt
-          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> build-info.txt
+          # 使用您在仓库 Secrets 中配置的 GHCR_PAT 进行登录
+          echo "${{ secrets.GHCR_PAT }}" | docker login ${{ env.REGISTRY }} -u wkk08 --password-stdin
 
-      - name: Upload build info
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-info
-          path: build-info.txt
-          retention-days: 30
+      - name: Tag and Push to GHCR
+        run: |
+          # 标记镜像
+          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          
+          echo "开始推送镜像到 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} ..."
+          
+          # 推送镜像（使用已验证的路径）
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          
+          echo "✅ 镜像推送成功！"
+          
+          # 记录用于部署的镜像名
+          echo "DEPLOY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
 
-  # 4. 部署到红帽服务器
+  # 第四阶段：蓝绿部署（基于您之前的有效部署逻辑）
   deploy:
-    runs-on: ubuntu-latest
+    name: Blue-Green Deployment
     needs: build-and-push
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup SSH
         uses: webfactory/ssh-agent@v0.7.0
@@ -163,48 +164,73 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H ${{ secrets.DEPLOY_SERVER_IP }} >> ~/.ssh/known_hosts
 
-      - name: Copy deployment files
+      - name: Copy deployment files to server
         run: |
+          # 同步部署文件
           rsync -avz --delete \
             --exclude '.git' \
             --exclude '.github' \
             deploy/ \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }}:${{ secrets.DEPLOY_DIR }}/
 
-      - name: Execute deployment
+      - name: Execute blue-green deployment
         run: |
+          # SSH 到服务器执行部署脚本
           ssh -o StrictHostKeyChecking=no \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
             cd ${{ secrets.DEPLOY_DIR }}
-            export IMAGE_TAG=\"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}\"
+            
+            # 设置环境变量
+            export IMAGE_TAG=\"${{ env.DEPLOY_IMAGE }}\"
+            
+            # 获取当前颜色
             if [ -f current_color ]; then
               CURRENT_COLOR=\$(cat current_color)
             else
               CURRENT_COLOR=\"blue\"
             fi
+            
+            # 确定新颜色
             if [ \"\$CURRENT_COLOR\" = \"blue\" ]; then
               NEW_COLOR=\"green\"
             else
               NEW_COLOR=\"blue\"
             fi
-            echo \"开始蓝绿部署...\"
-            echo \"新镜像: \$IMAGE_TAG\"
-            echo \"新颜色: \$NEW_COLOR\"
-            # 更新环境变量文件
-            if [ \"\$NEW_COLOR\" = \"blue\" ]; then
-              sed -i \"s|BLUE_TAG=.*|BLUE_TAG=\$IMAGE_TAG|\" .env
-            else
-              sed -i \"s|GREEN_TAG=.*|GREEN_TAG=\$IMAGE_TAG|\" .env
-            fi
+            
+            echo \"=======================================\"
+            echo \"执行蓝绿部署\"
+            echo \"目标镜像: \$IMAGE_TAG\"
+            echo \"部署环境: \$NEW_COLOR\"
+            echo \"=======================================\"
+            
             # 执行部署脚本
             ./scripts/deploy \"\$IMAGE_TAG\" \"\$NEW_COLOR\"
+            
+            # 等待并健康检查
             sleep 20
             if ./scripts/health_check; then
+              # 切换流量
               ./scripts/switch_traffic \"\$NEW_COLOR\"
               echo \"\$NEW_COLOR\" > current_color
-              echo \"✅ 部署成功！\"
+              echo \"✅ 部署成功！当前活跃环境: \$NEW_COLOR\"
             else
+              echo \"健康检查失败，执行回滚\"
               ./scripts/rollback
               exit 1
             fi
           "
+
+      - name: Verify deployment
+        run: |
+          # 验证部署
+          echo "等待服务响应..."
+          for i in {1..12}; do
+            if curl -f -s http://${{ secrets.DEPLOY_SERVER_IP }}/health > /dev/null; then
+              echo "✅ 部署验证成功！服务健康。"
+              exit 0
+            fi
+            echo "尝试 $i/12: 服务尚未就绪，等待5秒..."
+            sleep 5
+          done
+          echo "❌ 部署验证失败。"
+          exit 1
