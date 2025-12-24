@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  # Nginx反向代理
+  proxy:
+    image: nginx:alpine
+    container_name: webcalc_proxy
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+    ports:
+      - "80:80"
+    networks:
+      - webcalc_network
+
+  # Blue版本应用
+  app_blue:
+    image: ${BLUE_TAG:-registry.gitlab.com/${CI_PROJECT_PATH}:latest}
+    container_name: webcalc_blue
+    environment:
+      - FLASK_ENV=production
+      - PORT=5000
+    networks:
+      - webcalc_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+
+  # Green版本应用
+  app_green:
+    image: ${GREEN_TAG:-registry.gitlab.com/${CI_PROJECT_PATH}:latest}
+    container_name: webcalc_green
+    environment:
+      - FLASK_ENV=production
+      - PORT=5001
+    networks:
+      - webcalc_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+
+networks:
+  webcalc_network:
+    driver: bridge

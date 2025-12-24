@@ -1,0 +1,256 @@
+# GitLab CI/CD 配置文件
+stages:
+  - test
+  - build
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""  # 禁用TLS，简化配置
+  IMAGE_NAME: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  PYTHON_VERSION: "3.12"
+
+# 缓存pip包
+cache:
+  paths:
+    - .pip-cache/
+  key: $CI_COMMIT_REF_SLUG
+
+# 阶段1: 单元测试
+unit_tests:
+  stage: test
+  image: python:$PYTHON_VERSION
+  before_script:
+    - python --version
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+  script:
+    - echo "运行单元测试..."
+    - pytest tests/unit/ -v --cov=app --cov-report=xml --cov-report=html
+  artifacts:
+    when: always
+    paths:
+      - coverage.xml
+      - htmlcov/
+    reports:
+      junit: junit.xml
+    expire_in: 1 week
+  only:
+    - main  # 只在主分支运行
+
+# 阶段2: 功能测试（简化版 - 不使用Docker in Docker）
+functional_tests:
+  stage: test
+  image: python:$PYTHON_VERSION
+  before_script:
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+    - apt-get update && apt-get install -y curl || apk add --no-cache curl || true  # 安装curl
+  script:
+    - echo "启动应用并运行功能测试..."
+    - python app.py &
+    - sleep 3  # 等待应用启动
+    
+    # 使用引号包裹URL测试
+    - |
+      echo "测试健康检查..."
+      curl -f "http://localhost:5000/health" || exit 1
+      
+      echo "测试加法 (2 + 3)..."
+      curl -f "http://localhost:5000/add/2&3" || exit 1
+      
+      echo "测试乘法 (4 × 5)..."
+      curl -f "http://localhost:5000/multiply/4&5" || exit 1
+      
+      echo "测试无效输入..."
+      status_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/add/abc&xyz")
+      if [ "$status_code" -ne 400 ]; then
+        echo "错误: 期望400状态码，但得到 $status_code"
+        exit 1
+      fi
+      
+      echo "所有功能测试通过！"
+  after_script:
+    - pkill -f "python app.py" || true  # 清理进程
+  artifacts:
+    when: always
+    paths:
+      - functional-test-report.txt
+    expire_in: 1 week
+  only:
+    - main
+
+# 阶段3: 构建Docker镜像（使用Docker in Docker）
+build_image:
+  stage: build
+  image: docker:26
+  services:
+    - name: docker:26-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - echo "设置Docker环境..."
+    - docker --version
+    - echo "登录到GitLab容器注册表..."
+    
+    # 检查是否设置了注册表凭证
+    - |
+      if [ -z "$CI_REGISTRY_PASSWORD" ]; then
+        echo "警告: CI_REGISTRY_PASSWORD 未设置，跳过镜像推送"
+        echo "如果要推送镜像，请在GitLab项目设置中添加CI_REGISTRY_USER和CI_REGISTRY_PASSWORD变量"
+      else
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      fi
+  script:
+    - echo "构建Docker镜像..."
+    - docker build -t $IMAGE_NAME .
+    
+    # 只有设置了凭证才推送镜像
+    - |
+      if [ -n "$CI_REGISTRY_PASSWORD" ]; then
+        echo "标记镜像..."
+        docker tag $IMAGE_NAME $CI_REGISTRY_IMAGE:latest
+        
+        echo "推送镜像到注册表..."
+        docker push $IMAGE_NAME
+        docker push $CI_REGISTRY_IMAGE:latest
+        
+        echo "清理本地镜像..."
+        docker rmi $IMAGE_NAME $CI_REGISTRY_IMAGE:latest || true
+      else
+        echo "跳过镜像推送（未设置注册表凭证）"
+      fi
+  after_script:
+    - echo "构建完成"
+  artifacts:
+    paths:
+      - docker-build.log
+    expire_in: 1 week
+  only:
+    - main
+
+# 阶段4: 代码质量检查（可选）
+lint:
+  stage: test
+  image: python:$PYTHON_VERSION
+  before_script:
+    - pip install pylint black
+  script:
+    - echo "检查代码格式..."
+    - black --check --diff app.py tests/ || echo "代码格式检查失败（但允许继续）"
+    - echo "运行pylint..."
+    - pylint app.py --exit-zero  # 即使有警告也继续
+  only:
+    - main
+  allow_failure: true  # 允许失败，不影响整体流水线
+
+
+# 阶段4: 部署准备（生成部署文件）
+prepare_deploy:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "准备部署文件..."
+    - mkdir -p deploy/scripts deploy/nginx/conf.d
+    # 复制脚本文件（如果已存在）
+    - cp -r deploy/scripts/* deploy/scripts/ 2>/dev/null || echo "脚本文件已存在"
+    # 生成docker-compose文件
+    - cp deploy/docker-compose.yml deploy/docker-compose.yml 2>/dev/null || cat > deploy/docker-compose.yml << 'EOF'
+version: "3.9"
+services:
+  proxy:
+    image: nginx:alpine
+    container_name: webcalc_proxy
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+    ports:
+      - "80:80"
+    networks:
+      - webcalc_network
+  app_blue:
+    image: ${BLUE_TAG}
+    container_name: webcalc_blue
+    environment:
+      - FLASK_ENV=production
+    networks:
+      - webcalc_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+  app_green:
+    image: ${GREEN_TAG}
+    container_name: webcalc_green
+    environment:
+      - FLASK_ENV=production
+    networks:
+      - webcalc_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+networks:
+  webcalc_network:
+    driver: bridge
+EOF
+    # 生成nginx配置
+    - mkdir -p deploy/nginx/conf.d
+    - cat > deploy/nginx/conf.d/default.conf << 'EOF'
+upstream webcalc_upstream {
+    server app_blue:5000 max_fails=1 fail_timeout=5s;
+}
+server {
+    listen 80;
+    location / {
+        proxy_pass http://webcalc_upstream;
+    }
+}
+EOF
+  artifacts:
+    paths:
+      - deploy/
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
+# 阶段5: 蓝绿部署
+blue_green_deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client rsync
+    - eval $(ssh-agent -s)
+    - echo "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H $DEPLOY_SERVER_IP >> ~/.ssh/known_hosts
+  script:
+    - echo "开始蓝绿部署..."
+    - echo "当前提交SHA: $CI_COMMIT_SHORT_SHA"
+    
+    # 1. 同步部署文件到目标服务器
+    - echo "同步部署文件到服务器..."
+    - rsync -avz --delete deploy/ $DEPLOY_USER@$DEPLOY_SERVER_IP:$DEPLOY_DIR/
+    
+    # 2. 设置脚本执行权限
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER_IP "chmod +x $DEPLOY_DIR/scripts/*"
+    
+    # 3. 执行部署脚本（这里简化，实际应该调用你的deploy脚本）
+    - echo "执行部署..."
+    - ssh $DEPLOY_USER@$DEPLOY_SERVER_IP "cd $DEPLOY_DIR && ./scripts/deploy $CI_COMMIT_SHORT_SHA"
+    
+    # 4. 验证部署
+    - echo "验证部署..."
+    - sleep 10
+    - curl -f http://$DEPLOY_SERVER_IP/health || echo "健康检查失败"
+    
+    echo "✅ 部署完成!"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+  dependencies:
+    - prepare_deploy

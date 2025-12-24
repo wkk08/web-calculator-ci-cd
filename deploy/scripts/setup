@@ -1,0 +1,150 @@
+#!/bin/bash
+# 环境初始化脚本 - 适用于未注册的红帽系统
+
+set -e
+
+DEPLOY_DIR="/opt/web-calculator"
+
+echo "开始初始化部署环境..."
+
+# 1. 检查是否已安装 Podman 或 Docker
+echo "检查容器运行时..."
+if command -v docker &> /dev/null; then
+    echo "✅ Docker 已安装"
+    CONTAINER_RUNTIME="docker"
+elif command -v podman &> /dev/null; then
+    echo "✅ Podman 已安装"
+    CONTAINER_RUNTIME="podman"
+else
+    echo "未找到 Docker 或 Podman，尝试安装 Podman..."
+    
+    # 2. 尝试安装 Podman（使用 CentOS 仓库）
+    echo "尝试从 CentOS 仓库安装 Podman..."
+    
+    # 备份现有仓库
+    sudo mkdir -p /etc/yum.repos.d/backup
+    sudo mv /etc/yum.repos.d/*.repo /etc/yum.repos.d/backup/ 2>/dev/null || true
+    
+    # 添加 CentOS 8 仓库（兼容 RHEL 8）
+    echo "添加 CentOS 仓库..."
+    sudo cat > /etc/yum.repos.d/centos.repo << 'REPOEOF'
+[baseos]
+name=CentOS-$releasever - BaseOS
+baseurl=http://mirror.centos.org/centos/8/BaseOS/$basearch/os/
+gpgcheck=0
+enabled=1
+
+[appstream]
+name=CentOS-$releasever - AppStream
+baseurl=http://mirror.centos.org/centos/8/AppStream/$basearch/os/
+gpgcheck=0
+enabled=1
+
+[extras]
+name=CentOS-$releasever - Extras
+baseurl=http://mirror.centos.org/centos/8/extras/$basearch/os/
+gpgcheck=0
+enabled=1
+REPOEOF
+    
+    # 清理并安装 Podman
+    echo "安装 Podman..."
+    sudo yum clean all
+    sudo yum install -y podman podman-docker podman-compose slirp4netns
+    
+    if command -v podman &> /dev/null; then
+        echo "✅ Podman 安装成功"
+        CONTAINER_RUNTIME="podman"
+        
+        # 创建 Docker 别名
+        echo "alias docker='podman'" >> ~/.bashrc
+        echo "alias docker-compose='podman-compose'" >> ~/.bashrc
+        source ~/.bashrc
+    else
+        echo "❌ Podman 安装失败，尝试其他方法..."
+        
+        # 尝试从 EPEL 安装
+        echo "尝试从 EPEL 安装 Podman..."
+        sudo yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+        sudo yum install -y podman podman-docker podman-compose
+        
+        if command -v podman &> /dev/null; then
+            echo "✅ Podman 安装成功（通过 EPEL）"
+            CONTAINER_RUNTIME="podman"
+            
+            # 创建 Docker 别名
+            echo "alias docker='podman'" >> ~/.bashrc
+            echo "alias docker-compose='podman-compose'" >> ~/.bashrc
+            source ~/.bashrc
+        else
+            echo "❌ 无法安装容器运行时。请手动安装 Docker 或 Podman。"
+            exit 1
+        fi
+    fi
+fi
+
+# 3. 检查其他必要工具
+echo "检查其他必要工具..."
+for tool in curl wget git; do
+    if ! command -v $tool &> /dev/null; then
+        echo "安装 $tool..."
+        
+        # 尝试多种安装方法
+        if command -v yum &> /dev/null; then
+            sudo yum install -y $tool || echo "警告: 无法安装 $tool"
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y $tool || echo "警告: 无法安装 $tool"
+        else
+            echo "无法找到包管理器来安装 $tool"
+        fi
+    else
+        echo "✅ $tool 已安装"
+    fi
+done
+
+# 4. 创建部署目录
+echo "创建部署目录: $DEPLOY_DIR"
+sudo mkdir -p $DEPLOY_DIR
+sudo mkdir -p $DEPLOY_DIR/nginx/conf.d
+sudo mkdir -p $DEPLOY_DIR/logs
+
+# 5. 设置目录权限
+echo "设置目录权限..."
+sudo chown -R $(whoami):$(whoami) $DEPLOY_DIR 2>/dev/null || true
+chmod -R 755 $DEPLOY_DIR
+
+# 6. 如果使用 Podman，配置无根模式
+if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+    echo "配置 Podman 无根模式..."
+    
+    # 启用用户命名空间
+    sudo touch /etc/subuid /etc/subgid 2>/dev/null || true
+    sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(whoami) 2>/dev/null || true
+    
+    # 配置存储
+    podman system migrate 2>/dev/null || true
+    
+    echo "注意: 使用 Podman 作为 Docker 替代品"
+    echo "命令 'docker' 和 'docker-compose' 已配置为 Podman 的别名"
+fi
+
+# 7. 验证安装
+echo "=== 验证安装 ==="
+echo "容器运行时: $CONTAINER_RUNTIME"
+$CONTAINER_RUNTIME --version 2>/dev/null || echo "无法获取版本信息"
+
+# 8. 测试运行一个简单容器
+echo "测试运行容器..."
+$CONTAINER_RUNTIME run --rm hello-world 2>/dev/null && echo "✅ 容器测试成功" || echo "⚠️ 容器测试失败（可能因为网络或权限）"
+
+echo ""
+echo "✅ 环境初始化完成！"
+echo ""
+echo "下一步操作："
+echo "1. 确保 $DEPLOY_DIR/.env 文件中的镜像标签正确"
+echo "2. 运行部署脚本: ./scripts/deploy <image_tag> <color>"
+echo "3. 切换流量: ./scripts/switch_traffic <color>"
+echo ""
+echo "如果需要手动安装容器运行时，请参考："
+echo "- Docker: https://docs.docker.com/engine/install/"
+echo "- Podman: https://podman.io/docs/installation"
