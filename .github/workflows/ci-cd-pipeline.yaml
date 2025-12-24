@@ -7,30 +7,25 @@ on:
     branches: [ main ]
 
 env:
-  # 固定镜像名称
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/web-calculator-ci-cd
 
 jobs:
-  # 第一阶段：单元测试
   unit-test:
     name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
           cache: 'pip'
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
       - name: Run unit tests
         run: |
           if [ -d tests/unit ]; then
@@ -38,7 +33,6 @@ jobs:
           else
             echo "未找到单元测试目录，跳过。"
           fi
-
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
@@ -47,7 +41,6 @@ jobs:
           path: coverage.xml
           retention-days: 7
 
-  # 第二阶段：功能测试
   functional-test:
     name: Functional Tests
     runs-on: ubuntu-latest
@@ -55,73 +48,53 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Run functional tests
         run: |
-          # 启动Flask应用
           python app.py &
           APP_PID=$!
-          
-          # 等待应用启动
           sleep 5
-          
-          # 运行测试
           echo "测试健康检查..."
           curl -f "http://localhost:5000/health" || (echo "健康检查失败"; exit 1)
-          
           echo "测试加法..."
           curl -f "http://localhost:5000/add/2&3" || (echo "加法测试失败"; exit 1)
-          
           echo "测试乘法..."
           curl -f "http://localhost:5000/multiply/4&5" || (echo "乘法测试失败"; exit 1)
-          
           echo "测试无效输入..."
           STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/add/abc&xyz")
           if [ "$STATUS_CODE" -ne 400 ]; then
             echo "无效输入测试失败，期望400，得到$STATUS_CODE"
             exit 1
           fi
-          
           echo "所有功能测试通过！"
-          
-          # 停止应用
           kill $APP_PID 2>/dev/null || true
 
-  # 第三阶段：构建和推送 Docker 镜像
   build-and-push:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     needs: [unit-test, functional-test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
-
       - name: Extract metadata for Docker tags
         id: meta
         uses: docker/metadata-action@v4
@@ -131,7 +104,6 @@ jobs:
             type=sha,prefix=,format=short
             type=ref,event=branch
             type=raw,value=latest
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
@@ -141,65 +113,48 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
       - name: Generate deployment info
         run: |
           echo "DEPLOY_IMAGE_TAG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
           echo "IMAGE_BUILT=true" >> $GITHUB_ENV
 
-  # 第四阶段：蓝绿部署（使用新SSH密钥）
   deploy:
     name: Blue-Green Deployment
     runs-on: ubuntu-latest
     needs: build-and-push
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Setup SSH connection with new private key
         run: |
-          # 创建 .ssh 目录并设置正确权限
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          
-          # 将您提供的新SSH私钥写入文件
+          # 关键修复：EOF标记前的私钥内容必须顶格，不能有缩进
           cat > ~/.ssh/deploy_key << 'EOF'
-          -----BEGIN OPENSSH PRIVATE KEY-----
-          b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-          QyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQAAAKCrK/1Tqyv9
-          UwAAAAtzc2gtZWQyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQ
-          AAAED15Qi9OXWWF6YtGcEkjH1BKnOEahD3gz1ybKCb2A0aE+7KKK1nnt0fg5CXcl97SW91
-          xmp/tV3X53U8kdyAQOEpAAAAGnJvb3RAbG9jYWxob3N0LmxvY2FsZG9tYWluAQID
-          -----END OPENSSH PRIVATE KEY-----
-          EOF
-          
-          # 严格设置私钥文件权限（SSH强制要求）
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQAAAKCrK/1Tqyv9
+UwAAAAtzc2gtZWQyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQ
+AAAED15Qi9OXWWF6YtGcEkjH1BKnOEahD3gz1ybKCb2A0aE+7KKK1nnt0fg5CXcl97SW91
+xmp/tV3X53U8kdyAQOEpAAAAGnJvb3RAbG9jYWxob3N0LmxvY2FsZG9tYWluAQID
+-----END OPENSSH PRIVATE KEY-----
+EOF
           chmod 600 ~/.ssh/deploy_key
-          
-          # 将服务器主机密钥加入已知主机列表
           ssh-keyscan -H ${{ secrets.DEPLOY_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
           chmod 644 ~/.ssh/known_hosts
-          
-          # 测试SSH连接
           echo "正在测试SSH连接..."
           ssh -o BatchMode=yes -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "echo '✅ SSH连接测试成功'"
 
       - name: Execute blue-green deployment on server
         run: |
-          # 本次部署的完整镜像标签
           DEPLOY_IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/web-calculator-ci-cd:${{ github.sha }}"
           echo "要部署的镜像标签: $DEPLOY_IMAGE_TAG"
-          
-          # 通过SSH在服务器上执行部署
           ssh -o BatchMode=yes -i ~/.ssh/deploy_key \
             ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
             cd ${{ secrets.DEPLOY_DIR }}
-            
             echo '--- 开始蓝绿部署 ---'
-            
-            # 检查当前活跃颜色
             if [ -f current_color ]; then
               CURRENT_COLOR=\$(cat current_color)
               echo '当前活跃颜色:' \$CURRENT_COLOR
@@ -207,8 +162,6 @@ jobs:
               CURRENT_COLOR='blue'
               echo '未找到当前颜色记录，默认为:' \$CURRENT_COLOR
             fi
-            
-            # 确定新颜色（蓝绿互换）
             if [ \"\$CURRENT_COLOR\" = 'blue' ]; then
               NEW_COLOR='green'
               TARGET_VAR='GREEN_TAG'
@@ -216,48 +169,33 @@ jobs:
               NEW_COLOR='blue'
               TARGET_VAR='BLUE_TAG'
             fi
-            
             echo '本次将部署到颜色:' \$NEW_COLOR
-            
-            # 更新环境变量文件
             if grep -q \"^\"\$TARGET_VAR\"=\" .env 2>/dev/null; then
               sed -i \"s|^\"\$TARGET_VAR\"=.*|\"\$TARGET_VAR\"=$DEPLOY_IMAGE_TAG|\" .env
             else
               echo \"\\n\"\$TARGET_VAR\"=$DEPLOY_IMAGE_TAG\" >> .env
             fi
             echo '已更新环境变量:' \$TARGET_VAR
-            
-            # 使用podman-compose重新部署
             echo '拉取新镜像并重启服务...'
             podman-compose pull
-            
             echo '启动容器...'
             podman-compose up -d --force-recreate
-            
-            # 等待容器就绪
             echo '等待容器就绪 (约30秒)...'
             sleep 30
-            
-            # 健康检查
             echo '检查新容器健康状态...'
             if ./scripts/health_check; then
               echo '✅ 新版本容器健康检查通过'
-              
-              # 切换流量
               if [ -f ./scripts/switch_traffic ]; then
                 ./scripts/switch_traffic \"\$NEW_COLOR\"
                 echo \"✅ 流量已切换至 \$NEW_COLOR 环境\"
               else
                 echo \"⚠️  未找到switch_traffic脚本，跳过流量切换\"
               fi
-              
-              # 更新当前活跃颜色记录
               echo \"\$NEW_COLOR\" > current_color
               echo \"--- 蓝绿部署成功！当前活跃颜色: \$NEW_COLOR ---\"
               exit 0
             else
               echo '❌ 新版本容器健康检查失败，执行回滚...'
-              # 重启服务以回滚
               podman-compose up -d
               echo '已回滚至之前稳定版本。'
               exit 1
