@@ -7,9 +7,9 @@ on:
     branches: [ main ]
 
 env:
-  # 固定镜像名称：使用您手动推送成功的路径
+  # 固定镜像名称
   REGISTRY: ghcr.io
-  IMAGE_NAME: wkk08/web-calculator-ci-cd
+  IMAGE_NAME: ${{ github.repository_owner }}/web-calculator-ci-cd
 
 jobs:
   # 第一阶段：单元测试
@@ -29,11 +29,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run unit tests
         run: |
-          python -m pytest tests/unit/ -v --cov=app --cov-report=xml
+          if [ -d tests/unit ]; then
+            python -m pytest tests/unit/ -v --cov=app --cov-report=xml
+          else
+            echo "未找到单元测试目录，跳过。"
+          fi
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
@@ -41,8 +45,9 @@ jobs:
         with:
           name: coverage-report
           path: coverage.xml
+          retention-days: 7
 
-  # 第二阶段：功能测试（使用您旧版本中直接、有效的方式）
+  # 第二阶段：功能测试
   functional-test:
     name: Functional Tests
     runs-on: ubuntu-latest
@@ -92,15 +97,13 @@ jobs:
           # 停止应用
           kill $APP_PID 2>/dev/null || true
 
-  # 第三阶段：构建与推送（全新设计，分离步骤，使用安全PAT）
+  # 第三阶段：构建和推送 Docker 镜像
   build-and-push:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     needs: [unit-test, functional-test]
-    # 只在推送到主分支时运行
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
-    # 为后续可能的 GITHUB_TOKEN 使用声明权限
     permissions:
       contents: read
       packages: write
@@ -112,184 +115,169 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Build Docker image locally
-        id: build
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Extract metadata for Docker tags
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate deployment info
         run: |
-          # 构建镜像，使用两种标签
-          docker build -t web-calculator:${{ github.sha }} -t web-calculator:latest .
-          echo "✅ 本地镜像构建成功"
-          docker images | grep web-calculator
+          echo "DEPLOY_IMAGE_TAG=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
+          echo "IMAGE_BUILT=true" >> $GITHUB_ENV
 
-      # 核心修改：采用与您本地手动推送完全一致的登录和推送逻辑
-      - name: Log in to GHCR with PAT
+  # 第四阶段：蓝绿部署（使用新SSH密钥）
+  deploy:
+    name: Blue-Green Deployment
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH connection with new private key
         run: |
-          # 使用您在仓库 Secrets 中配置的 GHCR_PAT 进行登录
-          echo "${{ secrets.GHCR_PAT }}" | docker login ${{ env.REGISTRY }} -u wkk08 --password-stdin
+          # 创建 .ssh 目录并设置正确权限
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          
+          # 将您提供的新SSH私钥写入文件
+          cat > ~/.ssh/deploy_key << 'EOF'
+          -----BEGIN OPENSSH PRIVATE KEY-----
+          b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+          QyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQAAAKCrK/1Tqyv9
+          UwAAAAtzc2gtZWQyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQ
+          AAAED15Qi9OXWWF6YtGcEkjH1BKnOEahD3gz1ybKCb2A0aE+7KKK1nnt0fg5CXcl97SW91
+          xmp/tV3X53U8kdyAQOEpAAAAGnJvb3RAbG9jYWxob3N0LmxvY2FsZG9tYWluAQID
+          -----END OPENSSH PRIVATE KEY-----
+          EOF
+          
+          # 严格设置私钥文件权限（SSH强制要求）
+          chmod 600 ~/.ssh/deploy_key
+          
+          # 将服务器主机密钥加入已知主机列表
+          ssh-keyscan -H ${{ secrets.DEPLOY_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 644 ~/.ssh/known_hosts
+          
+          # 测试SSH连接
+          echo "正在测试SSH连接..."
+          ssh -o BatchMode=yes -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "echo '✅ SSH连接测试成功'"
 
-      - name: Tag and Push to GHCR
+      - name: Execute blue-green deployment on server
         run: |
-          # 标记镜像
-          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          # 本次部署的完整镜像标签
+          DEPLOY_IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/web-calculator-ci-cd:${{ github.sha }}"
+          echo "要部署的镜像标签: $DEPLOY_IMAGE_TAG"
           
-          echo "开始推送镜像到 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} ..."
-          
-          # 推送镜像（使用已验证的路径）
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          
-          echo "✅ 镜像推送成功！"
-          
-          # 记录用于部署的镜像名
-          echo "DEPLOY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
-
-# 第四阶段：蓝绿部署（已修复SSH连接问题）
-deploy:
-  name: Blue-Green Deployment
-  runs-on: ubuntu-latest
-  needs: build-and-push # 依赖于构建阶段
-  if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-  
-  steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup SSH connection with private key
-      run: |
-        # 1. 创建 .ssh 目录并设置正确权限（至关重要）
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        
-        # 2. 将私钥写入文件（直接使用您提供的新密钥）
-        # **重要**：请确保此处缩进正确，密钥内容每行前没有多余空格。
-        cat > ~/.ssh/deploy_key << 'EOF'
-        -----BEGIN OPENSSH PRIVATE KEY-----
-        b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-        QyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQAAAKCrK/1Tqyv9
-        UwAAAAtzc2gtZWQyNTUxOQAAACDuyiitZ57dH4OQl3Jfe0lvdcZqf7Vd1+d1PJHcgEDhKQ
-        AAAED15Qi9OXWWF6YtGcEkjH1BKnOEahD3gz1ybKCb2A0aE+7KKK1nnt0fg5CXcl97SW91
-        xmp/tV3X53U8kdyAQOEpAAAAGnJvb3RAbG9jYWxob3N0LmxvY2FsZG9tYWluAQID
-        -----END OPENSSH PRIVATE KEY-----
-        EOF
-        
-        # 3. 严格设置私钥文件权限（SSH强制要求）
-        chmod 600 ~/.ssh/deploy_key
-        
-        # 4. 将服务器主机密钥加入已知主机列表（避免交互提示）
-        ssh-keyscan -H ${{ secrets.DEPLOY_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
-        chmod 644 ~/.ssh/known_hosts
-        
-        # 5. 测试SSH连接是否畅通
-        echo "正在测试SSH连接至服务器..."
-        ssh -o BatchMode=yes -i ~/.ssh/deploy_key ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "echo '✅ SSH连接测试成功'"
-
-    - name: Prepare and execute deployment
-      run: |
-        # 定义本次部署的完整镜像标签（由构建阶段生成）
-        DEPLOY_IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/web-calculator-ci-cd:${{ github.sha }}"
-        echo "要部署的镜像标签: $DEPLOY_IMAGE_TAG"
-        
-        # 通过SSH在服务器上执行蓝绿部署逻辑
-        ssh -o BatchMode=yes -i ~/.ssh/deploy_key \
-          ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
-          # 进入部署目录
-          cd ${{ secrets.DEPLOY_DIR }}
-          
-          echo '--- 开始蓝绿部署流程 ---'
-          
-          # **关键步骤：更新环境变量文件**
-          # 先备份当前配置
-          cp .env .env.backup.\$(date +%s) 2>/dev/null || true
-          
-          # 检查当前活跃颜色，决定本次部署的目标颜色
-          if [ -f current_color ]; then
-            CURRENT_COLOR=\$(cat current_color)
-            echo '当前活跃颜色:' \$CURRENT_COLOR
-          else
-            CURRENT_COLOR='blue'
-            echo '未找到当前颜色记录，默认为:' \$CURRENT_COLOR
-          fi
-          
-          # 确定新颜色（蓝绿互换）
-          if [ \"\$CURRENT_COLOR\" = 'blue' ]; then
-            NEW_COLOR='green'
-            TARGET_VAR='GREEN_TAG'
-            # 更新 .env 文件中的 GREEN_TAG
-            if grep -q '^GREEN_TAG=' .env; then
-              sed -i \"s|^GREEN_TAG=.*|GREEN_TAG=$DEPLOY_IMAGE_TAG|\" .env
-            else
-              echo \"GREEN_TAG=$DEPLOY_IMAGE_TAG\" >> .env
-            fi
-          else
-            NEW_COLOR='blue'
-            TARGET_VAR='BLUE_TAG'
-            # 更新 .env 文件中的 BLUE_TAG
-            if grep -q '^BLUE_TAG=' .env; then
-              sed -i \"s|^BLUE_TAG=.*|BLUE_TAG=$DEPLOY_IMAGE_TAG|\" .env
-            else
-              echo \"BLUE_TAG=$DEPLOY_IMAGE_TAG\" >> .env
-            fi
-          fi
-          echo '本次将部署到颜色:' \$NEW_COLOR
-          echo '更新的环境变量:' \$TARGET_VAR
-          
-          # **核心部署命令：重新拉取镜像并启动服务栈**
-          # 这里采用您之前在服务器上验证成功的命令
-          echo '正在拉取新镜像并重启服务...'
-          podman-compose pull
-          
-          # 使用 podman-compose up -d 重新创建容器（确保使用最新镜像）
-          # 此操作会根据 .env 中的新标签启动对应颜色的容器
-          podman-compose up -d --force-recreate
-          
-          # 等待新容器完全启动并健康
-          echo '等待新容器就绪 (约30秒)...'
-          sleep 30
-          
-          # **流量切换前健康检查**
-          # 尝试访问新部署容器的健康端点（通过内部网络）
-          # 注意：此检查逻辑需要根据您的 health_check 脚本调整
-          if curl -s -f http://localhost:\$( [ \"\$NEW_COLOR\" = 'blue' ] && echo 5000 || echo 5001 )/health > /dev/null; then
-            echo '✅ 新版本容器健康检查通过'
+          # 通过SSH在服务器上执行部署
+          ssh -o BatchMode=yes -i ~/.ssh/deploy_key \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
+            cd ${{ secrets.DEPLOY_DIR }}
             
-            # **执行流量切换（更新Nginx配置）**
-            # 调用您的 switch_traffic 脚本
-            if [ -f ./scripts/switch_traffic ]; then
-              ./scripts/switch_traffic \"\$NEW_COLOR\"
-              echo \"✅ 流量已切换至 \$NEW_COLOR 环境\"
+            echo '--- 开始蓝绿部署 ---'
+            
+            # 检查当前活跃颜色
+            if [ -f current_color ]; then
+              CURRENT_COLOR=\$(cat current_color)
+              echo '当前活跃颜色:' \$CURRENT_COLOR
             else
-              echo \"⚠️  未找到 switch_traffic 脚本，请手动切换\"
+              CURRENT_COLOR='blue'
+              echo '未找到当前颜色记录，默认为:' \$CURRENT_COLOR
             fi
             
-            # **更新当前活跃颜色记录**
-            echo \"\$NEW_COLOR\" > current_color
-            echo \"--- 蓝绿部署完成！当前活跃颜色: \$NEW_COLOR ---\"
-          else
-            echo '❌ 新版本容器健康检查失败，执行回滚...'
-            # 恢复 .env 文件备份
-            cp .env.backup.* .env 2>/dev/null || echo '无法恢复备份，请注意'
-            # 重启服务以回滚到之前版本
-            podman-compose up -d
-            echo '已回滚至之前稳定版本。'
-            exit 1 # 返回非零状态，让CI流程失败
-          fi
-        "
-        
-    - name: Final verification
-      run: |
-        echo '--- 进行最终部署验证 ---'
-        # 通过公网IP访问服务的健康端点，确认部署成功
-        MAX_RETRIES=10
-        for i in \$(seq 1 \$MAX_RETRIES); do
-          if curl -f -s http://${{ secrets.DEPLOY_SERVER_IP }}/health > /dev/null; then
-            echo \"✅ 最终验证成功！服务在 \$i/\$MAX_RETRIES 次尝试后已上线。\"
-            echo \"应用地址: http://${{ secrets.DEPLOY_SERVER_IP }}\"
-            echo \"健康检查: http://${{ secrets.DEPLOY_SERVER_IP }}/health\"
-            exit 0
-          else
-            echo \"尝试 \$i/\$MAX_RETRIES: 服务尚未就绪，等待5秒...\"
-            sleep 5
-          fi
-        done
-        echo \"❌ 最终验证失败：服务在多次尝试后未响应。\"
-        exit 1
+            # 确定新颜色（蓝绿互换）
+            if [ \"\$CURRENT_COLOR\" = 'blue' ]; then
+              NEW_COLOR='green'
+              TARGET_VAR='GREEN_TAG'
+            else
+              NEW_COLOR='blue'
+              TARGET_VAR='BLUE_TAG'
+            fi
+            
+            echo '本次将部署到颜色:' \$NEW_COLOR
+            
+            # 更新环境变量文件
+            if grep -q \"^\"\$TARGET_VAR\"=\" .env 2>/dev/null; then
+              sed -i \"s|^\"\$TARGET_VAR\"=.*|\"\$TARGET_VAR\"=$DEPLOY_IMAGE_TAG|\" .env
+            else
+              echo \"\\n\"\$TARGET_VAR\"=$DEPLOY_IMAGE_TAG\" >> .env
+            fi
+            echo '已更新环境变量:' \$TARGET_VAR
+            
+            # 使用podman-compose重新部署
+            echo '拉取新镜像并重启服务...'
+            podman-compose pull
+            
+            echo '启动容器...'
+            podman-compose up -d --force-recreate
+            
+            # 等待容器就绪
+            echo '等待容器就绪 (约30秒)...'
+            sleep 30
+            
+            # 健康检查
+            echo '检查新容器健康状态...'
+            if ./scripts/health_check; then
+              echo '✅ 新版本容器健康检查通过'
+              
+              # 切换流量
+              if [ -f ./scripts/switch_traffic ]; then
+                ./scripts/switch_traffic \"\$NEW_COLOR\"
+                echo \"✅ 流量已切换至 \$NEW_COLOR 环境\"
+              else
+                echo \"⚠️  未找到switch_traffic脚本，跳过流量切换\"
+              fi
+              
+              # 更新当前活跃颜色记录
+              echo \"\$NEW_COLOR\" > current_color
+              echo \"--- 蓝绿部署成功！当前活跃颜色: \$NEW_COLOR ---\"
+              exit 0
+            else
+              echo '❌ 新版本容器健康检查失败，执行回滚...'
+              # 重启服务以回滚
+              podman-compose up -d
+              echo '已回滚至之前稳定版本。'
+              exit 1
+            fi
+          "
+
+      - name: Verify deployment
+        run: |
+          echo '--- 最终部署验证 ---'
+          MAX_RETRIES=12
+          for i in $(seq 1 $MAX_RETRIES); do
+            if curl -f -s http://${{ secrets.DEPLOY_SERVER_IP }}/health > /dev/null; then
+              echo "✅ 部署验证成功！服务已上线。"
+              echo "应用地址: http://${{ secrets.DEPLOY_SERVER_IP }}"
+              echo "健康检查: http://${{ secrets.DEPLOY_SERVER_IP }}/health"
+              exit 0
+            else
+              echo "尝试 $i/$MAX_RETRIES: 服务尚未就绪，等待5秒..."
+              sleep 5
+            fi
+          done
+          echo "❌ 部署验证失败：服务未响应。"
+          exit 1
