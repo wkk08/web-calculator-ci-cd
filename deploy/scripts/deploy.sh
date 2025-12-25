@@ -1,9 +1,9 @@
 #!/bin/bash
-# 蓝绿部署脚本 - 完整版
+# 蓝绿部署脚本 - root用户版本
 
 set -e  # 遇到错误时退出
 
-# 配置
+# 配置 - root用户不需要sudo
 DEPLOY_DIR="/opt/web-calculator"
 NGINX_CONF_DIR="$DEPLOY_DIR/nginx/conf.d"
 BACKUP_DIR="$DEPLOY_DIR/backups"
@@ -32,9 +32,10 @@ if [[ ! "$NEW_COLOR" =~ ^(blue|green)$ ]]; then
 fi
 
 log "========================================="
-log "🚀 开始蓝绿部署"
+log "🚀 开始蓝绿部署 (root用户)"
 log "镜像标签: $IMAGE_TAG"
 log "新部署颜色: $NEW_COLOR"
+log "部署目录: $DEPLOY_DIR"
 log "========================================="
 
 # 1. 检查当前颜色
@@ -54,7 +55,7 @@ else
     OLD_COLOR="none"
 fi
 
-# 2. 创建必要的目录
+# 2. 创建必要的目录（root用户有权限）
 mkdir -p "$DEPLOY_DIR" "$NGINX_CONF_DIR" "$BACKUP_DIR"
 
 # 3. 拉取新镜像
@@ -64,6 +65,8 @@ if ! docker pull "$IMAGE_TAG"; then
     exit 1
 fi
 log "✅ 镜像拉取成功"
+
+
 
 # 4. 创建新的docker-compose配置
 log "📝 生成docker-compose配置"

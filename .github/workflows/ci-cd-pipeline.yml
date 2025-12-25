@@ -116,7 +116,7 @@ jobs:
     # 从 build-and-push 作业获取输出
     env:
       DEPLOY_IMAGE: ${{ needs.build-and-push.outputs.image-tag }}
-      steps:
+
 
     steps:
       - name: Checkout code
@@ -185,13 +185,24 @@ jobs:
       - name: Execute blue-green deployment
         run: |
           echo "开始在远程服务器执行部署..."
-          # 使用已经验证的SSH连接执行部署命令
+          
+          # 构造镜像标签（使用环境变量或直接构造）
+          IMAGE_TAG="${{ env.DEPLOY_IMAGE }}"
+          echo "使用的镜像标签: $IMAGE_TAG"
+          
           ssh -i ~/.ssh/deploy_key \
               ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
-            cd ${{ secrets.DEPLOY_DIR }}
+            # ==== 核心修复：重置并打印环境，用于调试 ====
+            # 重置 PATH，确保 /usr/bin 优先
+            export PATH=\"/usr/bin:/bin:/usr/sbin:/sbin\"
+            echo \"=== 环境调试信息 ===\"
+            echo \"当前PATH: \$PATH\"
+            echo \"Docker路径: \$(which docker)\"
+            echo \"Docker客户端版本: \$(docker version --format '{{.Client.Version}}' 2>/dev/null || echo '获取失败')\"
+            echo \"Docker服务端API版本: \$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || echo '获取失败')\"
             
-            # 设置环境变量（使用CI构建出的新镜像）
-            export IMAGE_TAG=\"${{ env.DEPLOY_IMAGE }}\"
+            # ==== 执行部署 ====
+            cd ${{ secrets.DEPLOY_DIR }}
             
             # 判断当前颜色
             if [ -f current_color ]; then
@@ -206,10 +217,49 @@ jobs:
               NEW_COLOR=\"blue\"
             fi
             
-            echo \"开始蓝绿部署，新镜像: \$IMAGE_TAG, 新颜色: \$NEW_COLOR\"
+            echo \"开始蓝绿部署，新镜像: $IMAGE_TAG, 新颜色: \$NEW_COLOR\"
             
-            # 执行部署脚本
-            ./scripts/deploy \"\$IMAGE_TAG\" \"\$NEW_COLOR\" && sleep 20
+            # 方法：使用纯 Docker 命令进行蓝绿部署（替代有问题的 docker-compose）
+            # 1. 拉取镜像
+            docker pull \"$IMAGE_TAG\"
+            
+            # 2. 停止并移除旧颜色的容器
+            docker stop \"web-calculator-\$NEW_COLOR\" 2>/dev/null || true
+            docker rm \"web-calculator-\$NEW_COLOR\" 2>/dev/null || true
+            
+            # 3. 启动新颜色的容器
+            # 根据颜色分配不同的内部端口，但都通过nginx代理到80端口
+            if [ \"\$NEW_COLOR\" = \"blue\" ]; then
+              INTERNAL_PORT=8080
+            else
+              INTERNAL_PORT=8081
+            fi
+            
+            docker run -d \\
+              --name \"web-calculator-\$NEW_COLOR\" \\
+              --restart unless-stopped \\
+              -p \$INTERNAL_PORT:5000 \\
+              \"$IMAGE_TAG\"
+            
+            # 4. (可选) 更新nginx配置并重启，将流量指向新颜色的容器
+            # 这里简化处理：如果nginx配置已经指向了 upstream，则只需确保容器运行。
+            # 更复杂的流量切换逻辑可以根据需要补充。
+            
+            # 5. 更新当前颜色记录
+            echo \"\$NEW_COLOR\" > current_color
+            
+            echo \"等待新容器启动...\"
+            sleep 15
+            
+            # 6. 验证新容器健康状态
+            if curl -f \"http://localhost:\$INTERNAL_PORT/health\" > /dev/null 2>&1; then
+              echo \"✅ 新颜色 (\$NEW_COLOR) 容器部署成功！\"
+            else
+              echo \"❌ 新容器健康检查失败。\"
+              echo \"查看容器日志：\"
+              docker logs \"web-calculator-\$NEW_COLOR\" --tail 20
+              exit 1
+            fi
           "
 
       - name: Verify deployment
