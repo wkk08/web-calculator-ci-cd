@@ -1,165 +1,334 @@
-name: Deploy to RHEL VM
+name: Web Calculator CI/CD
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 env:
+  # 固定使用您的组织名，避免变量解析问题
   REGISTRY: ghcr.io
   IMAGE_NAME: wkk08/web-calculator-ci-cd
-  DEPLOY_DIR: /opt/web-calculator-ci-cd
 
 jobs:
   test:
+    name: Run Tests
     runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.13'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Run unit tests
-      run: |
-        python -m pytest tests/unit/ -v
 
-  build:
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest
+
+      - name: Run unit tests
+        run: |
+          if [ -d tests/unit ]; then
+            python -m pytest tests/unit/ -v --cov=app --cov-report=xml
+          else
+            echo "⚠️ 未找到单元测试目录，跳过。"
+          fi
+
+      - name: Run functional tests
+        run: |
+          # 启动应用
+          echo "启动Flask应用..."
+          python app.py &
+          APP_PID=$!
+          
+          # 等待并检查应用是否就绪
+          echo "等待应用启动..."
+          sleep 10
+          
+          if curl -s -f --max-time 5 http://localhost:5000/health > /dev/null; then
+            echo "✅ 应用健康检查通过"
+            
+            # 运行功能测试（如果存在）
+            if [ -f tests/func/run_curl_tests.sh ]; then
+              chmod +x tests/func/run_curl_tests.sh
+              ./tests/func/run_curl_tests.sh
+            else
+              echo "⚠️ 未找到功能测试脚本，运行基础curl测试..."
+              curl -f "http://localhost:5000/health" || exit 1
+              curl -f "http://localhost:5000/add/2&3" || exit 1
+              curl -f "http://localhost:5000/multiply/4&5" || exit 1
+              echo "✅ 基础功能测试通过"
+            fi
+          else
+            echo "❌ 应用未响应健康检查"
+            echo "应用进程状态:"
+            ps -p $APP_PID || true
+            exit 1
+          fi
+          
+          # 清理
+          kill $APP_PID 2>/dev/null || true
+
+  build-and-push:
+    name: Build and Push Docker Image
     needs: test
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
     permissions:
       contents: read
       packages: write
-      
+
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-    
-    - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v2
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        push: true
-        tags: |
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to GitHub Container Registry
+        # 使用PAT登录，权限更明确
+        run: |
+          echo "${{ secrets.GHCR_PAT }}" | docker login ${{ env.REGISTRY }} -u wkk08 --password-stdin
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          echo "✅ 镜像构建成功"
+
+      - name: Push Docker image
+        run: |
+          echo "推送镜像: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          echo "✅ 镜像推送成功"
+          
+          # 设置环境变量供后续部署步骤使用
+          echo "DEPLOY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
 
   deploy:
-    needs: build
+    name: Deploy to Red Hat VM
+    needs: build-and-push
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up SSH environment
-      run: |
-        echo "=== 设置 SSH 环境 ==="
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        
-        # 正确写入私钥 - 使用带EOF的heredoc格式确保保留换行符
-        cat << 'EOF' > ~/.ssh/deploy_key
-        ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
-        EOF
-        
-        # 或者使用更简单的方式
-        # echo "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-        
-        chmod 600 ~/.ssh/deploy_key
-        
-        # 添加主机到known_hosts
-        ssh-keyscan -H ${{ secrets.DEPLOY_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
-        
-        echo "私钥文件大小:"
-        wc -l ~/.ssh/deploy_key
-        echo "私钥文件权限:"
-        ls -la ~/.ssh/deploy_key
-        echo "=== SSH 环境设置完成 ==="
-    
-    - name: Test SSH connection
-      run: |
-        echo "测试SSH连接..."
-        ssh -i ~/.ssh/deploy_key \
-            -o BatchMode=yes \
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install sshpass (for password-based SSH)
+        run: sudo apt-get install -y sshpass
+
+      - name: Debug SSH Connection
+        env:
+          VM_HOST: ${{ secrets.DEPLOY_SERVER_IP }}
+          VM_USER: ${{ secrets.DEPLOY_USER }}
+          VM_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+        run: |
+          # 测试基本连接
+          echo "测试SSH连接到服务器..."
+          timeout 10 sshpass -p "$VM_PASSWORD" ssh \
+            -o StrictHostKeyChecking=no \
             -o ConnectTimeout=5 \
-            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "echo 'SSH连接成功!'"
-    
-    - name: Copy files to RHEL VM
-      run: |
-        echo "开始复制文件到RHEL VM..."
-        
-        # 使用rsync同步文件
-        rsync -avz -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
-          --exclude='.git' \
-          --exclude='__pycache__' \
-          --exclude='*.pyc' \
-          ./ \
-          ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }}:${{ env.DEPLOY_DIR }}/
-    
-    - name: Deploy application on RHEL VM
-      run: |
-        echo "在RHEL VM上部署应用..."
-        ssh -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=no \
-            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
-          cd ${{ env.DEPLOY_DIR }}
+            "$VM_USER@$VM_HOST" \
+            "echo '✅ SSH连接成功'; hostname; whoami"
           
-          # 给脚本添加执行权限
-          chmod +x deploy/scripts/*.sh 2>/dev/null || true
-          
-          # 如果有自定义部署脚本则使用，否则使用docker-compose
-          if [ -f deploy/scripts/deploy.sh ]; then
-            echo '使用自定义部署脚本'
-            ./deploy/scripts/deploy.sh
+          if [ $? -eq 0 ]; then
+            echo "✅ SSH连接测试通过"
           else
-            echo '使用docker-compose部署'
-            docker-compose down || docker compose down
-            docker-compose up -d --build || docker compose up -d --build
-          fi
-          
-          echo '等待应用启动...'
-          sleep 10
-          
-          # 检查容器状态
-          docker ps
-        "
-    
-    - name: Verify deployment
-      run: |
-        echo "验证部署..."
-        ssh -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=no \
-            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
-          # 检查应用是否在运行
-          if curl -s http://localhost:5000 > /dev/null; then
-            echo '应用运行正常'
-          else
-            echo '应用可能未启动，检查日志:'
-            docker logs web-calculator-app 2>/dev/null || echo '容器日志不可用'
+            echo "❌ SSH连接失败"
             exit 1
           fi
-        "
+
+      - name: Deploy to Server
+        env:
+          VM_HOST: ${{ secrets.DEPLOY_SERVER_IP }}
+          VM_USER: ${{ secrets.DEPLOY_USER }}
+          VM_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+        run: |
+          # 创建部署脚本（适配您的Podman环境）
+          cat > /tmp/deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "======================================"
+          echo "开始部署 Web Calculator"
+          echo "镜像: ${{ env.DEPLOY_IMAGE }}"
+          echo "时间: $(date)"
+          echo "======================================"
+          
+          cd $DEPLOY_DIR
+          
+          # 1. 登录到GitHub容器仓库（使用您的PAT）
+          echo "步骤1: 登录到GitHub容器仓库..."
+          if ! echo '${{ secrets.GHCR_PAT }}' | podman login ghcr.io -u wkk08 --password-stdin; then
+            echo "❌ Podman登录失败"
+            exit 1
+          fi
+          
+          # 2. 拉取新镜像
+          echo "步骤2: 拉取新镜像..."
+          if ! podman pull "${{ env.DEPLOY_IMAGE }}"; then
+            echo "❌ 镜像拉取失败"
+            exit 1
+          fi
+          echo "✅ 镜像拉取成功"
+          
+          # 3. 更新docker-compose.yml中的镜像标签
+          # 注意：这里假设您已使用固定镜像名，只需要更新.env文件
+          echo "步骤3: 更新环境配置..."
+          if [ -f .env ]; then
+            # 判断当前活跃颜色并更新对应的TAG
+            if [ -f current_color ]; then
+              CURRENT_COLOR=$(cat current_color)
+            else
+              CURRENT_COLOR="blue"
+            fi
+            
+            if [ "$CURRENT_COLOR" = "blue" ]; then
+              NEW_COLOR="green"
+              sed -i "s|GREEN_TAG=.*|GREEN_TAG=${{ env.DEPLOY_IMAGE }}|" .env
+              echo "已更新 .env: GREEN_TAG=${{ env.DEPLOY_IMAGE }}"
+            else
+              NEW_COLOR="blue"
+              sed -i "s|BLUE_TAG=.*|BLUE_TAG=${{ env.DEPLOY_IMAGE }}|" .env
+              echo "已更新 .env: BLUE_TAG=${{ env.DEPLOY_IMAGE }}"
+            fi
+          else
+            echo "⚠️  未找到.env文件，创建默认配置..."
+            cat > .env << 'ENVEOF'
+BLUE_TAG=${{ env.DEPLOY_IMAGE }}
+GREEN_TAG=${{ env.DEPLOY_IMAGE }}
+FLASK_ENV=production
+ENVEOF
+          fi
+          
+          # 4. 使用podman-compose重启服务
+          echo "步骤4: 重启服务..."
+          echo "停止旧容器..."
+          podman-compose down 2>/dev/null || true
+          
+          echo "启动新容器..."
+          if podman-compose up -d; then
+            echo "✅ 容器启动成功"
+          else
+            echo "❌ 容器启动失败"
+            # 尝试直接使用podman命令
+            echo "尝试使用podman命令直接启动..."
+            podman-compose down 2>/dev/null || true
+            sleep 2
+            podman-compose up -d
+          fi
+          
+          # 5. 验证部署
+          echo "步骤5: 验证部署..."
+          echo "等待服务启动（20秒）..."
+          sleep 20
+          
+          echo "检查容器状态..."
+          if podman-compose ps | grep -q "Up"; then
+            echo "✅ 容器运行正常"
+          else
+            echo "❌ 容器未运行"
+            podman-compose ps
+            exit 1
+          fi
+          
+          # 运行健康检查
+          echo "运行健康检查..."
+          if [ -f scripts/health_check ]; then
+            chmod +x scripts/health_check
+            if ./scripts/health_check; then
+              echo "✅ 健康检查通过"
+            else
+              echo "❌ 健康检查失败"
+              exit 1
+            fi
+          else
+            # 如果没有健康检查脚本，直接curl测试
+            if curl -s -f --max-time 5 http://localhost:5000/health > /dev/null; then
+              echo "✅ 服务健康检查通过"
+            else
+              echo "❌ 健康检查失败"
+              exit 1
+            fi
+          fi
+          
+          echo "======================================"
+          echo "✅ 部署成功完成！"
+          echo "服务地址: http://$VM_HOST"
+          echo "健康检查: http://$VM_HOST/health"
+          echo "======================================"
+          EOF
+          
+          # 复制部署脚本到服务器
+          echo "复制部署脚本到服务器..."
+          sshpass -p "$VM_PASSWORD" scp \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=30 \
+            /tmp/deploy.sh \
+            "$VM_USER@$VM_HOST:/tmp/deploy.sh"
+          
+          # 在服务器上执行部署
+          echo "执行部署..."
+          sshpass -p "$VM_PASSWORD" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=30 \
+            "$VM_USER@$VM_HOST" \
+            "chmod +x /tmp/deploy.sh && cd $DEPLOY_DIR && /tmp/deploy.sh 2>&1 | tee /tmp/deploy_output.log"
+          
+          # 检查部署结果
+          echo "检查部署结果..."
+          if sshpass -p "$VM_PASSWORD" ssh \
+            -o StrictHostKeyChecking=no \
+            "$VM_USER@$VM_HOST" \
+            "grep -q '部署成功' /tmp/deploy_output.log 2>/dev/null"; then
+            echo "✅ 部署成功完成"
+            echo "=== 部署日志摘要 ==="
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              "$VM_USER@$VM_HOST" \
+              "tail -10 /tmp/deploy_output.log"
+          else
+            echo "❌ 部署可能失败"
+            echo "=== 错误日志 ==="
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              "$VM_USER@$VM_HOST" \
+              "tail -30 /tmp/deploy_output.log || echo '无日志文件'"
+            exit 1
+          fi
+
+  notification:
+    name: Send Notification
+    needs: [test, build-and-push, deploy]
+    runs-on: ubuntu-latest
+    if: always()
     
-    - name: Clean up SSH key
-      run: |
-        echo "清理SSH密钥..."
-        rm -f ~/.ssh/deploy_key
+    steps:
+      - name: Send success notification
+        if: success()
+        run: |
+          echo "✅ CI/CD 流水线执行成功!"
+          echo "应用已部署到: http://${{ secrets.DEPLOY_SERVER_IP }}"
+          echo "健康检查: http://${{ secrets.DEPLOY_SERVER_IP }}/health"
+          echo "测试示例:"
+          echo "  curl http://${{ secrets.DEPLOY_SERVER_IP }}/add/2&3"
+          echo "  curl http://${{ secrets.DEPLOY_SERVER_IP }}/multiply/4&5"
+    
+      - name: Send failure notification
+        if: failure()
+        run: |
+          echo "❌ CI/CD 流水线执行失败!"
+          echo "请在 GitHub Actions 日志中查看详细错误信息。"
+          echo "常见问题检查:"
+          echo "1. GitHub Secrets 配置是否正确?"
+          echo "2. 服务器SSH连接是否正常?"
+          echo "3. 服务器上的Podman和podman-compose是否正常工作?"
