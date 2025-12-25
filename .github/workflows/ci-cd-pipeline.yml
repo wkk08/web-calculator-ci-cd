@@ -1,334 +1,220 @@
-name: Web Calculator CI/CD
+name: CI/CD Pipeline for Web Calculator
 
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 env:
-  # 固定使用您的组织名，避免变量解析问题
   REGISTRY: ghcr.io
   IMAGE_NAME: wkk08/web-calculator-ci-cd
 
 jobs:
-  test:
-    name: Run Tests
+  unit-test:
+    name: Unit Tests
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.12'
           cache: 'pip'
-
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pytest
-
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
       - name: Run unit tests
         run: |
-          if [ -d tests/unit ]; then
-            python -m pytest tests/unit/ -v --cov=app --cov-report=xml
-          else
-            echo "⚠️ 未找到单元测试目录，跳过。"
-          fi
+          python -m pytest tests/unit/ -v --cov=app --cov-report=xml
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
 
+  functional-test:
+    name: Functional Tests
+    runs-on: ubuntu-latest
+    needs: unit-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
       - name: Run functional tests
         run: |
-          # 启动应用
-          echo "启动Flask应用..."
           python app.py &
           APP_PID=$!
-          
-          # 等待并检查应用是否就绪
-          echo "等待应用启动..."
-          sleep 10
-          
-          if curl -s -f --max-time 5 http://localhost:5000/health > /dev/null; then
-            echo "✅ 应用健康检查通过"
-            
-            # 运行功能测试（如果存在）
-            if [ -f tests/func/run_curl_tests.sh ]; then
-              chmod +x tests/func/run_curl_tests.sh
-              ./tests/func/run_curl_tests.sh
-            else
-              echo "⚠️ 未找到功能测试脚本，运行基础curl测试..."
-              curl -f "http://localhost:5000/health" || exit 1
-              curl -f "http://localhost:5000/add/2&3" || exit 1
-              curl -f "http://localhost:5000/multiply/4&5" || exit 1
-              echo "✅ 基础功能测试通过"
-            fi
-          else
-            echo "❌ 应用未响应健康检查"
-            echo "应用进程状态:"
-            ps -p $APP_PID || true
+          sleep 5
+          echo "测试健康检查..."
+          curl -f "http://localhost:5000/health" || (echo "健康检查失败"; exit 1)
+          echo "测试加法..."
+          curl -f "http://localhost:5000/add/2&3" || (echo "加法测试失败"; exit 1)
+          echo "测试乘法..."
+          curl -f "http://localhost:5000/multiply/4&5" || (echo "乘法测试失败"; exit 1)
+          echo "测试无效输入..."
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/add/abc&xyz")
+          if [ "$STATUS_CODE" -ne 400 ]; then
+            echo "无效输入测试失败，期望400，得到$STATUS_CODE"
             exit 1
           fi
-          
-          # 清理
+          echo "所有功能测试通过！"
           kill $APP_PID 2>/dev/null || true
 
   build-and-push:
     name: Build and Push Docker Image
-    needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-
+    needs: [unit-test, functional-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
-
-      - name: Log in to GitHub Container Registry
-        # 使用PAT登录，权限更明确
+      - name: Build Docker image locally
+        run: |
+          docker build -t web-calculator:${{ github.sha }} -t web-calculator:latest .
+          echo "✅ 本地镜像构建成功"
+      - name: Log in to GHCR with PAT
         run: |
           echo "${{ secrets.GHCR_PAT }}" | docker login ${{ env.REGISTRY }} -u wkk08 --password-stdin
-
-      - name: Build Docker image
+      - name: Tag and Push to GHCR
         run: |
-          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
-          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          echo "✅ 镜像构建成功"
-
-      - name: Push Docker image
-        run: |
-          echo "推送镜像: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag web-calculator:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          echo "开始推送镜像到 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} ..."
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          echo "✅ 镜像推送成功"
-          
-          # 设置环境变量供后续部署步骤使用
+          echo "✅ 镜像推送成功！"
           echo "DEPLOY_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_ENV
 
   deploy:
-    name: Deploy to Red Hat VM
-    needs: build-and-push
+    name: Blue-Green Deployment
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install sshpass (for password-based SSH)
-        run: sudo apt-get install -y sshpass
-
-      - name: Debug SSH Connection
-        env:
-          VM_HOST: ${{ secrets.DEPLOY_SERVER_IP }}
-          VM_USER: ${{ secrets.DEPLOY_USER }}
-          VM_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+      - name: Setup SSH Key and Debug Connection
         run: |
-          # 测试基本连接
-          echo "测试SSH连接到服务器..."
-          timeout 10 sshpass -p "$VM_PASSWORD" ssh \
-            -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=5 \
-            "$VM_USER@$VM_HOST" \
-            "echo '✅ SSH连接成功'; hostname; whoami"
+          # 1. 创建 .ssh 目录并设置权限
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           
-          if [ $? -eq 0 ]; then
-            echo "✅ SSH连接测试通过"
+          # 2. 将私钥写入文件 (关键: 检查格式，必须包含完整的BEGIN/END行)
+          echo "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          
+          # 3. 将服务器主机指纹加入已知主机列表
+          ssh-keyscan -H ${{ secrets.DEPLOY_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null
+          
+          # 4. 关键: 打印文件状态用于调试
+          echo "=== SSH 调试信息 ==="
+          echo "私钥文件前3行:"
+          head -3 ~/.ssh/deploy_key
+          echo "私钥文件权限:"
+          ls -la ~/.ssh/deploy_key
+          echo "known_hosts 内容:"
+          cat ~/.ssh/known_hosts
+          echo "===================="
+
+      # >>>>> 核心新增步骤：详细的SSH连接调试 <<<<<
+      - name: Debug SSH Connection (Verbose)
+        run: |
+          echo "🧪 开始执行详细SSH连接调试..."
+          # 使用 -vvv 参数输出最详细日志，并用 tee 同时输出到屏幕和文件以便完整查看
+          ssh -vvv \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              -i ~/.ssh/deploy_key \
+              ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} \
+              "echo '远程命令执行成功: OK from $(hostname)'" 2>&1 | tee /tmp/ssh_debug.log
+          
+          # 捕获上一条命令的退出状态码
+          SSH_EXIT_CODE=${PIPESTATUS[0]}
+          echo "ssh exit code=$SSH_EXIT_CODE"
+          
+          # 根据退出码给出明确的失败原因提示
+          if [ $SSH_EXIT_CODE -ne 0 ]; then
+            echo "❌ SSH 连接测试失败！"
+            echo "请查看上方详细的 -vvv 日志。常见原因："
+            echo "1. 'Permission denied' -> GitHub Secrets 中的私钥或服务器上的公钥/授权文件有问题"
+            echo "2. 'Connection timed out' -> 网络/防火墙/端口问题，IP地址或端口(${{ secrets.DEPLOY_PORT || '22' }})错误"
+            echo "3. 'Could not resolve hostname' -> DEPLOY_SERVER_IP 配置错误"
+            echo "4. 'invalid format' / 'Load key' 错误 -> DEPLOY_SSH_PRIVATE_KEY 格式损坏（注意换行）"
+            echo "5. 其他错误请根据 -vvv 输出判断"
+            # 故意失败，停止后续部署
+            exit 1
           else
-            echo "❌ SSH连接失败"
-            exit 1
+            echo "✅ SSH 连接调试通过！"
           fi
 
-      - name: Deploy to Server
-        env:
-          VM_HOST: ${{ secrets.DEPLOY_SERVER_IP }}
-          VM_USER: ${{ secrets.DEPLOY_USER }}
-          VM_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
-          DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+      - name: Copy deployment files to server
         run: |
-          # 创建部署脚本（适配您的Podman环境）
-          cat > /tmp/deploy.sh << 'EOF'
-          #!/bin/bash
-          set -e
-          
-          echo "======================================"
-          echo "开始部署 Web Calculator"
-          echo "镜像: ${{ env.DEPLOY_IMAGE }}"
-          echo "时间: $(date)"
-          echo "======================================"
-          
-          cd $DEPLOY_DIR
-          
-          # 1. 登录到GitHub容器仓库（使用您的PAT）
-          echo "步骤1: 登录到GitHub容器仓库..."
-          if ! echo '${{ secrets.GHCR_PAT }}' | podman login ghcr.io -u wkk08 --password-stdin; then
-            echo "❌ Podman登录失败"
-            exit 1
-          fi
-          
-          # 2. 拉取新镜像
-          echo "步骤2: 拉取新镜像..."
-          if ! podman pull "${{ env.DEPLOY_IMAGE }}"; then
-            echo "❌ 镜像拉取失败"
-            exit 1
-          fi
-          echo "✅ 镜像拉取成功"
-          
-          # 3. 更新docker-compose.yml中的镜像标签
-          # 注意：这里假设您已使用固定镜像名，只需要更新.env文件
-          echo "步骤3: 更新环境配置..."
-          if [ -f .env ]; then
-            # 判断当前活跃颜色并更新对应的TAG
+          echo "开始同步部署文件到服务器..."
+          # 使用调试成功的配置进行文件同步
+          scp -i ~/.ssh/deploy_key -o ConnectTimeout=10 -r deploy/* ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }}:${{ secrets.DEPLOY_DIR }}/
+
+      - name: Execute blue-green deployment
+        run: |
+          echo "开始在远程服务器执行部署..."
+          # 使用已经验证的SSH连接执行部署命令
+          ssh -i ~/.ssh/deploy_key \
+              ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} "
+            cd ${{ secrets.DEPLOY_DIR }}
+            
+            # 设置环境变量（使用CI构建出的新镜像）
+            export IMAGE_TAG=\"${{ env.DEPLOY_IMAGE }}\"
+            
+            # 判断当前颜色
             if [ -f current_color ]; then
-              CURRENT_COLOR=$(cat current_color)
+              CURRENT_COLOR=\$(cat current_color)
             else
-              CURRENT_COLOR="blue"
+              CURRENT_COLOR=\"blue\"
             fi
             
-            if [ "$CURRENT_COLOR" = "blue" ]; then
-              NEW_COLOR="green"
-              sed -i "s|GREEN_TAG=.*|GREEN_TAG=${{ env.DEPLOY_IMAGE }}|" .env
-              echo "已更新 .env: GREEN_TAG=${{ env.DEPLOY_IMAGE }}"
+            if [ \"\$CURRENT_COLOR\" = \"blue\" ]; then
+              NEW_COLOR=\"green\"
             else
-              NEW_COLOR="blue"
-              sed -i "s|BLUE_TAG=.*|BLUE_TAG=${{ env.DEPLOY_IMAGE }}|" .env
-              echo "已更新 .env: BLUE_TAG=${{ env.DEPLOY_IMAGE }}"
+              NEW_COLOR=\"blue\"
             fi
-          else
-            echo "⚠️  未找到.env文件，创建默认配置..."
-            cat > .env << 'ENVEOF'
-BLUE_TAG=${{ env.DEPLOY_IMAGE }}
-GREEN_TAG=${{ env.DEPLOY_IMAGE }}
-FLASK_ENV=production
-ENVEOF
-          fi
-          
-          # 4. 使用podman-compose重启服务
-          echo "步骤4: 重启服务..."
-          echo "停止旧容器..."
-          podman-compose down 2>/dev/null || true
-          
-          echo "启动新容器..."
-          if podman-compose up -d; then
-            echo "✅ 容器启动成功"
-          else
-            echo "❌ 容器启动失败"
-            # 尝试直接使用podman命令
-            echo "尝试使用podman命令直接启动..."
-            podman-compose down 2>/dev/null || true
-            sleep 2
-            podman-compose up -d
-          fi
-          
-          # 5. 验证部署
-          echo "步骤5: 验证部署..."
-          echo "等待服务启动（20秒）..."
-          sleep 20
-          
-          echo "检查容器状态..."
-          if podman-compose ps | grep -q "Up"; then
-            echo "✅ 容器运行正常"
-          else
-            echo "❌ 容器未运行"
-            podman-compose ps
-            exit 1
-          fi
-          
-          # 运行健康检查
-          echo "运行健康检查..."
-          if [ -f scripts/health_check ]; then
-            chmod +x scripts/health_check
-            if ./scripts/health_check; then
-              echo "✅ 健康检查通过"
-            else
-              echo "❌ 健康检查失败"
-              exit 1
-            fi
-          else
-            # 如果没有健康检查脚本，直接curl测试
-            if curl -s -f --max-time 5 http://localhost:5000/health > /dev/null; then
-              echo "✅ 服务健康检查通过"
-            else
-              echo "❌ 健康检查失败"
-              exit 1
-            fi
-          fi
-          
-          echo "======================================"
-          echo "✅ 部署成功完成！"
-          echo "服务地址: http://$VM_HOST"
-          echo "健康检查: http://$VM_HOST/health"
-          echo "======================================"
-          EOF
-          
-          # 复制部署脚本到服务器
-          echo "复制部署脚本到服务器..."
-          sshpass -p "$VM_PASSWORD" scp \
-            -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=30 \
-            /tmp/deploy.sh \
-            "$VM_USER@$VM_HOST:/tmp/deploy.sh"
-          
-          # 在服务器上执行部署
-          echo "执行部署..."
-          sshpass -p "$VM_PASSWORD" ssh \
-            -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=30 \
-            -o ServerAliveInterval=30 \
-            "$VM_USER@$VM_HOST" \
-            "chmod +x /tmp/deploy.sh && cd $DEPLOY_DIR && /tmp/deploy.sh 2>&1 | tee /tmp/deploy_output.log"
-          
-          # 检查部署结果
-          echo "检查部署结果..."
-          if sshpass -p "$VM_PASSWORD" ssh \
-            -o StrictHostKeyChecking=no \
-            "$VM_USER@$VM_HOST" \
-            "grep -q '部署成功' /tmp/deploy_output.log 2>/dev/null"; then
-            echo "✅ 部署成功完成"
-            echo "=== 部署日志摘要 ==="
-            sshpass -p "$VM_PASSWORD" ssh \
-              -o StrictHostKeyChecking=no \
-              "$VM_USER@$VM_HOST" \
-              "tail -10 /tmp/deploy_output.log"
-          else
-            echo "❌ 部署可能失败"
-            echo "=== 错误日志 ==="
-            sshpass -p "$VM_PASSWORD" ssh \
-              -o StrictHostKeyChecking=no \
-              "$VM_USER@$VM_HOST" \
-              "tail -30 /tmp/deploy_output.log || echo '无日志文件'"
-            exit 1
-          fi
+            
+            echo \"开始蓝绿部署，新镜像: \$IMAGE_TAG, 新颜色: \$NEW_COLOR\"
+            
+            # 执行部署脚本
+            ./scripts/deploy \"\$IMAGE_TAG\" \"\$NEW_COLOR\" && sleep 20
+          "
 
-  notification:
-    name: Send Notification
-    needs: [test, build-and-push, deploy]
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-      - name: Send success notification
-        if: success()
+      - name: Verify deployment
         run: |
-          echo "✅ CI/CD 流水线执行成功!"
-          echo "应用已部署到: http://${{ secrets.DEPLOY_SERVER_IP }}"
-          echo "健康检查: http://${{ secrets.DEPLOY_SERVER_IP }}/health"
-          echo "测试示例:"
-          echo "  curl http://${{ secrets.DEPLOY_SERVER_IP }}/add/2&3"
-          echo "  curl http://${{ secrets.DEPLOY_SERVER_IP }}/multiply/4&5"
-    
-      - name: Send failure notification
-        if: failure()
-        run: |
-          echo "❌ CI/CD 流水线执行失败!"
-          echo "请在 GitHub Actions 日志中查看详细错误信息。"
-          echo "常见问题检查:"
-          echo "1. GitHub Secrets 配置是否正确?"
-          echo "2. 服务器SSH连接是否正常?"
-          echo "3. 服务器上的Podman和podman-compose是否正常工作?"
+          echo "验证部署..."
+          MAX_RETRIES=12
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if curl -f -s http://${{ secrets.DEPLOY_SERVER_IP }}/health > /dev/null; then
+              echo "✅ 部署验证成功！服务健康。"
+              exit 0
+            fi
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            echo "尝试 $RETRY_COUNT/$MAX_RETRIES: 服务尚未就绪，等待5秒..."
+            sleep 5
+          done
+          
+          echo "❌ 部署验证失败：服务在多次尝试后未响应健康检查"
+          exit 1
