@@ -14,5 +14,9 @@ COPY . .
 # 暴露端口
 EXPOSE 5000
 
-# 运行应用
-CMD ["python", "app.py"]
+# 使用 Gunicorn 运行应用（生产环境）
+# `-b`：绑定地址和端口
+# `app:app`：第一个`app`是您的Python模块文件名（app.py），第二个`app`是Flask应用实例名
+# `--workers`：工作进程数，建议设置为 (2 * CPU核心数) + 1。这里设为4是一个通用起始值。
+# `--preload`：可选，加速启动并节省内存。
+CMD ["gunicorn", "-b", "0.0.0.0:5000", "app:app", "--workers", "4"]
