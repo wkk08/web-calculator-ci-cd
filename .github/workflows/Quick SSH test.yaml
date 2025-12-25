@@ -1,0 +1,6 @@
+- name: Quick SSH test
+  run: |
+    # 快速测试连接和基本功能
+    timeout 10 ssh -v -i ~/.ssh/deploy_key \
+        ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_SERVER_IP }} \
+        "echo 'SSH连接成功'; hostname; date"

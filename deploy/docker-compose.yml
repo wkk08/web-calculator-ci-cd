@@ -1,50 +1,36 @@
-# version: "3.9"
+# docker-compose.yml
+version: '3.8'
 
 services:
-  # Nginx反向代理 - 使用官方镜像，无变量
-  proxy:
-    image: nginx:alpine
-    container_name: webcalc_proxy
-    restart: always
+  app:
+    build: .
+    container_name: web-calculator-app
+    ports:
+      - "5000:5000"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./logs:/app/logs
+    environment:
+      - FLASK_ENV=production
+    restart: unless-stopped
+    networks:
+      - web-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: web-calculator-nginx
     ports:
       - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d
+      - ./deploy/nginx/default.conf:/etc/nginx/nginx.conf
+      - ./logs:/var/log/nginx
+    depends_on:
+      - app
+    restart: unless-stopped
     networks:
-      - webcalc_network
-
-  # Blue版本应用 - 直接使用您手动推送成功的镜像标签
-  app_blue:
-    image: ghcr.io/wkk08/web-calculator-ci-cd:manual-test
-    container_name: webcalc_blue
-    restart: always
-    environment:
-      - FLASK_ENV=production
-    networks:
-      - webcalc_network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-
-  # Green版本应用 - 直接使用您手动推送成功的镜像标签
-  app_green:
-    image: ghcr.io/wkk08/web-calculator-ci-cd:manual-test
-    container_name: webcalc_green
-    restart: always
-    environment:
-      - FLASK_ENV=production
-    networks:
-      - webcalc_network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+      - web-network
 
 networks:
-  webcalc_network:
+  web-network:
     driver: bridge
