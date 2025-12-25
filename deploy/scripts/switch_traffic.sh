@@ -1,48 +1,31 @@
 #!/bin/bash
-# 流量切换脚本
+# 手动流量切换脚本
 
 set -e
 
+DEPLOY_DIR="/opt/web-calculator"
+
 if [ $# -ne 1 ]; then
     echo "使用方法: $0 <color>"
-    echo "示例: $0 blue"
+    echo "示例: $0 green"
     exit 1
 fi
 
-NEW_COLOR=$1
-DEPLOY_DIR="/opt/web-calculator"
-NGINX_CONF="$DEPLOY_DIR/nginx/conf.d/default.conf"
+TARGET_COLOR=$1
 
-echo "开始流量切换到: $NEW_COLOR"
-
-# 备份当前配置
-cp $NGINX_CONF $NGINX_CONF.backup
-
-# 根据新颜色更新nginx配置
-if [ "$NEW_COLOR" = "blue" ]; then
-    sed -i 's/server app_green:5001/server app_blue:5000/' $NGINX_CONF
-    sed -i 's/# server app_blue:5000/server app_blue:5000/' $NGINX_CONF
-    sed -i '/server app_green:5001/s/^/# /' $NGINX_CONF
-else
-    sed -i 's/server app_blue:5000/server app_green:5001/' $NGINX_CONF
-    sed -i 's/# server app_green:5001/server app_green:5001/' $NGINX_CONF
-    sed -i '/server app_blue:5000/s/^/# /' $NGINX_CONF
+if [[ ! "$TARGET_COLOR" =~ ^(blue|green)$ ]]; then
+    echo "错误: 颜色必须是 'blue' 或 'green'"
+    exit 1
 fi
 
-# 重新加载nginx配置
-echo "重新加载nginx配置..."
-docker exec webcalc_proxy nginx -s reload
+# 更新nginx配置
+sed -i "s/server web-calculator-\(blue\|green\):5000;/server web-calculator-${TARGET_COLOR}:5000;/" \
+    "$DEPLOY_DIR/nginx/conf.d/web-calculator.conf"
 
-# 验证切换
-echo "验证流量切换..."
-sleep 3
-curl -f http://localhost/health > /dev/null 2>&1 || {
-    echo "❌ 流量切换后健康检查失败，恢复备份配置"
-    cp $NGINX_CONF.backup $NGINX_CONF
-    docker exec webcalc_proxy nginx -s reload
-    exit 1
-}
+# 重启nginx
+docker restart nginx-proxy
 
-echo "✅ 流量已成功切换到 $NEW_COLOR"
-echo "当前活跃颜色: $NEW_COLOR"
-echo $NEW_COLOR > $DEPLOY_DIR/current_color
+# 更新当前颜色
+echo "$TARGET_COLOR" > "$DEPLOY_DIR/current_color"
+
+echo "✅ 流量已切换到 $TARGET_COLOR 服务"

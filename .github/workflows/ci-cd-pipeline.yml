@@ -117,7 +117,7 @@ jobs:
     env:
       DEPLOY_IMAGE: ${{ needs.build-and-push.outputs.image-tag }}
       steps:
-       
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
